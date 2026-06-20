@@ -1,0 +1,13 @@
+bybit:
+  api_key: "YOUR_API_KEY"
+  api_secret: "YOUR_API_SECRET"
+  testnet: true
+  symbols:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+  timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+  leverage: 5

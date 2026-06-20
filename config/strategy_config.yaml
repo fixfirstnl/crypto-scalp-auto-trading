@@ -1,0 +1,29 @@
+strategy:
+  risk_per_trade: 0.005  # 0.5%
+  max_positions: 5
+  daily_loss_limit: 0.03  # 3%
+  weekly_loss_limit: 0.07  # 7%
+  max_consecutive_losses: 4
+  max_drawdown: 0.05  # 5%
+
+  indicators:
+    ema_fast: 9
+    ema_slow: 21
+    rsi_period: 14
+    atr_period: 14
+    volume_avg_period: 20
+
+  kill_zones:
+    london: {start: "02:00", end: "05:00", timezone: "EST"}
+    ny: {start: "07:00", end: "10:00", timezone: "EST"}
+
+  partials:
+    tp1: {r: 1.0, close_pct: 0.33}
+    tp2: {r: 2.0, close_pct: 0.33}
+    tp3: {r: 3.0, close_pct: 0.34, trailing: true}
+
+  filters:
+    spread_multiplier: 2.0
+    atr_min_multiplier: 1.0
+    atr_max_multiplier: 2.0
+    news_buffer_minutes: 15

@@ -1,0 +1,22 @@
+agents:
+  llm_model: "gpt-4o-mini"
+  timeout_seconds: 2
+
+  bias_agent:
+    role: "Higher-Timeframe Analyst"
+    goal: "Determine 1H/4H market bias using ICT structure"
+    confidence_threshold: 70
+
+  signal_agent:
+    role: "Entry Signal Generator"
+    goal: "Find ICT/SMC setups with 70%+ confidence"
+    confidence_threshold: 70
+
+  risk_agent:
+    role: "Risk Manager"
+    goal: "Protect capital with strict risk rules"
+    veto_power: true
+
+  exec_agent:
+    role: "Execution Optimizer"
+    goal: "Minimize slippage and optimize fills"
