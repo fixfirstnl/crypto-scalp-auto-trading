@@ -9,17 +9,14 @@ numpy>=1.24.0
 pandas-ta-classic>=0.4.0
 
 # Agent Framework
-# CrewAI requires Python 3.12+, so we use a lighter approach for 3.11
-# For Python 3.11: install crewai==0.22.0 (last version supporting 3.11)
-crewai==0.22.0
-
-# OR skip CrewAI and use rule-based agents only (recommended for 3.11):
-# Just comment out crewai above and the system will use rule-based logic
-# (which is already the default fast path)
+# CrewAI requires Python 3.12+. Skipped for Python 3.11.
+# The system uses rule-based agents by default (fast path).
+# Uncomment below IF you upgrade to Python 3.12+:
+# crewai==0.22.0
 
 # LangChain (optional, for CrewAI only)
-langchain>=0.1.0
-openai>=1.0.0
+# langchain>=0.1.0
+# openai>=1.0.0
 
 # Messaging & Notifications
 python-telegram-bot>=20.0
