@@ -1,3 +1,6 @@
+# Python 3.12 REQUIRED for CrewAI support
+# If using Python 3.11, use: python_embed (old directory) without CrewAI
+
 # Core trading infrastructure
 ccxt>=4.2.0
 
@@ -8,15 +11,13 @@ numpy>=1.24.0
 # TA Library (pandas-ta-classic is the maintained fork)
 pandas-ta-classic>=0.4.0
 
-# Agent Framework
-# CrewAI requires Python 3.12+. Skipped for Python 3.11.
-# The system uses rule-based agents by default (fast path).
-# Uncomment below IF you upgrade to Python 3.12+:
-# crewai==0.22.0
+# Agent Framework (requires Python 3.12+)
+crewai>=1.14.0
 
-# LangChain (optional, for CrewAI only)
-# langchain>=0.1.0
-# openai>=1.0.0
+# LangChain (for CrewAI integration)
+langchain>=1.0.0
+langchain-openai>=1.0.0
+openai>=2.0.0
 
 # Messaging & Notifications
 python-telegram-bot>=20.0
