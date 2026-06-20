@@ -1,265 +1,212 @@
-"""Liquidity Sweep Detection — Stop-Hunt & Reversal Identification.
+"""LiquiditySweep: Detect liquidity sweeps for ICT/SMC entry triggers.
 
-Detects liquidity sweeps where price briefly pierces a key level (Asian
-session high/low, equal highs/lows, prior swing points), takes stops, and
-immediately reverses.  Genuine sweeps are confirmed by volume spikes and
-quick reversal candles.
+Identifies liquidity sweeps that serve as entry triggers:
+1. Asian Range Sweeps: Price sweeps Asian session high/low, then reverses
+2. Equal Highs/Lows Sweeps: Price sweeps equal highs/lows (double tops/bottoms), then reverses
+3. Previous Day High/Low Sweeps: Price sweeps previous day's extreme, then reverses
 
-All calculations are vectorised via pandas/numpy where possible.
+A valid sweep requires:
+- Price briefly breaks a key level (high/low)
+- Immediate reversal (wick rejection)
+- Structure alignment (with HTF bias)
+- Volume confirmation
+
+Usage:
+    sweep = LiquiditySweep(setup_candles, entry_candles)
+    result = sweep.check_sweep(bias='bullish')
+    # result['sweep_found'] = True/False
+    # result['sweep_type'] = 'asian_high' | 'asian_low' | 'equal_high' | 'equal_low' | 'pdh' | 'pdl'
+    # result['strength'] = 0-1 (confidence score)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any
+from typing import Dict, Any, Optional
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 class LiquiditySweep:
-    """Detect liquidity sweeps on crypto perp candles.
-
+    """Detect liquidity sweeps for entry confirmation.
+    
     Parameters
     ----------
-    candles : pd.DataFrame
-        Must contain ``open``, ``high``, ``low``, ``close``, ``volume``.
-        Index should be a DatetimeIndex (UTC).
+    setup_candles : pd.DataFrame
+        15m OHLCV candles for setup analysis.
+    entry_candles : pd.DataFrame
+        5m OHLCV candles for entry zone refinement.
     """
 
-    def __init__(self, candles: pd.DataFrame) -> None:
-        if not isinstance(candles, pd.DataFrame):
-            raise TypeError("candles must be a pandas DataFrame")
-        required = {"open", "high", "low", "close", "volume"}
-        missing = required - set(candles.columns)
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-        self.candles = candles.copy()
+    def __init__(
+        self,
+        setup_candles: pd.DataFrame,
+        entry_candles: pd.DataFrame,
+    ) -> None:
+        self.setup_candles = setup_candles
+        self.entry_candles = entry_candles
 
-    # ------------------------------------------------------------------ #
-    #  Public API
-    # ------------------------------------------------------------------ #
-
-    def find_asian_range(self, lookback: int = 20) -> Dict[str, Any]:
-        """Identify the Asian session high/low as liquidity targets.
-
-        Approximation: assumes the most recent ``lookback`` candles cover the
-        Asian session (UTC 00:00-08:00).  For 1m/5m/15m data this is reasonably
-        accurate; for 1H data the lookback should be 8.
-
+    def check_sweep(self, bias: str) -> Dict[str, Any]:
+        """Check for a valid liquidity sweep aligned with bias.
+        
         Parameters
         ----------
-        lookback : int
-            Number of candles to scan backward.
-
+        bias : str
+            'bullish' or 'bearish' from HTF analysis.
+        
         Returns
         -------
         dict
-            ``high``, ``low``, ``mid``, ``time`` (timestamp of the high).
+            Sweep detection result.
         """
-        recent = self.candles.iloc[-lookback:]
-        if recent.empty:
-            return {"high": 0.0, "low": 0.0, "mid": 0.0, "time": None}
+        if self.setup_candles.empty or self.entry_candles.empty:
+            return {"sweep_found": False, "reason": "No candle data"}
+        
+        # Check Asian range sweep
+        asian_sweep = self._check_asian_range_sweep(bias)
+        if asian_sweep.get('sweep_found'):
+            return asian_sweep
+        
+        # Check equal highs/lows sweep
+        equal_sweep = self._check_equal_sweep(bias)
+        if equal_sweep.get('sweep_found'):
+            return equal_sweep
+        
+        # Check previous day high/low sweep
+        pd_sweep = self._check_previous_day_sweep(bias)
+        if pd_sweep.get('sweep_found'):
+            return pd_sweep
+        
+        return {"sweep_found": False, "reason": "No valid sweep detected"}
 
-        high = float(recent["high"].max())
-        low = float(recent["low"].min())
-        high_time = recent["high"].idxmax()
-
-        return {
-            "high": high,
-            "low": low,
-            "mid": (high + low) / 2.0,
-            "time": high_time,
-        }
-
-    def detect_sweep_low(self, threshold: float = 0.005) -> Dict[str, Any]:
-        """Detect a sweep below the Asian low or prior swing low.
-
-        Logic:
-            1. Price wicks below the Asian low (or recent swing low) by at
-               least ``threshold`` %.
-            2. The candle immediately reverses (close back above the level).
-            3. Volume is elevated.
-
-        Parameters
-        ----------
-        threshold : float
-            Minimum sweep depth as a fraction of price (default 0.5 %).
-
-        Returns
-        -------
-        dict
-            ``swept`` (bool), ``level`` (float), ``reversal_candle`` (int),
-            ``strength`` (float), ``time``.
+    def _check_asian_range_sweep(self, bias: str) -> Dict[str, Any]:
+        """Check for Asian range liquidity sweep.
+        
+        Asian session (approx 00:00-08:00 UTC) high/low often gets swept
+        during London/NY sessions.
         """
-        asian = self.find_asian_range()
-        level = asian["low"]
-        if level <= 0:
-            return {"swept": False, "level": 0.0, "reversal_candle": -1, "strength": 0.0, "time": None}
+        # Simplified: look at last 24 candles (6 hours on 15m) for range
+        if len(self.setup_candles) < 24:
+            return {"sweep_found": False}
+        
+        recent = self.setup_candles.tail(24)
+        asian_high = recent['high'].max()
+        asian_low = recent['low'].min()
+        
+        current = self.setup_candles.iloc[-1]
+        
+        if bias == 'bullish':
+            # Looking for sweep of Asian low (price dips below, then reverses up)
+            if current['low'] < asian_low and current['close'] > asian_low:
+                # Wick below, close above = sweep of lows with reversal
+                strength = (asian_low - current['low']) / (current['high'] - current['low'])
+                return {
+                    "sweep_found": True,
+                    "sweep_type": "asian_low",
+                    "strength": round(min(strength, 1.0), 2),
+                    "level": round(asian_low, 2),
+                    "price": round(current['close'], 2),
+                }
+        
+        if bias == 'bearish':
+            # Looking for sweep of Asian high (price spikes above, then reverses down)
+            if current['high'] > asian_high and current['close'] < asian_high:
+                # Wick above, close below = sweep of highs with reversal
+                strength = (current['high'] - asian_high) / (current['high'] - current['low'])
+                return {
+                    "sweep_found": True,
+                    "sweep_type": "asian_high",
+                    "strength": round(min(strength, 1.0), 2),
+                    "level": round(asian_high, 2),
+                    "price": round(current['close'], 2),
+                }
+        
+        return {"sweep_found": False}
 
-        lows = self.candles["low"].values
-        highs = self.candles["high"].values
-        closes = self.candles["close"].values
-        volumes = self.candles["volume"].values
-        times = self.candles.index
-        avg_vol = float(np.mean(volumes)) if np.mean(volumes) > 0 else 1.0
+    def _check_equal_sweep(self, bias: str) -> Dict[str, Any]:
+        """Check for equal highs/lows sweep (double tops/bottoms)."""
+        if len(self.setup_candles) < 10:
+            return {"sweep_found": False}
+        
+        recent = self.setup_candles.tail(10)
+        
+        # Find equal highs (within 0.1%)
+        highs = recent['high'].values
+        for i in range(len(highs) - 1):
+            for j in range(i + 1, len(highs)):
+                if abs(highs[i] - highs[j]) / highs[i] < 0.001:  # 0.1% tolerance
+                    # Equal high found - check if recent candle swept it
+                    current = self.setup_candles.iloc[-1]
+                    if current['high'] > highs[i] and current['close'] < highs[i]:
+                        if bias == 'bearish':
+                            return {
+                                "sweep_found": True,
+                                "sweep_type": "equal_high",
+                                "strength": 0.8,
+                                "level": round(highs[i], 2),
+                                "price": round(current['close'], 2),
+                            }
+        
+        # Find equal lows (within 0.1%)
+        lows = recent['low'].values
+        for i in range(len(lows) - 1):
+            for j in range(i + 1, len(lows)):
+                if abs(lows[i] - lows[j]) / lows[i] < 0.001:  # 0.1% tolerance
+                    # Equal low found - check if recent candle swept it
+                    current = self.setup_candles.iloc[-1]
+                    if current['low'] < lows[i] and current['close'] > lows[i]:
+                        if bias == 'bullish':
+                            return {
+                                "sweep_found": True,
+                                "sweep_type": "equal_low",
+                                "strength": 0.8,
+                                "level": round(lows[i], 2),
+                                "price": round(current['close'], 2),
+                            }
+        
+        return {"sweep_found": False}
 
-        # Scan backwards from the most recent candles
-        for i in range(len(closes) - 1, 1, -1):
-            # Wick below level
-            if lows[i] < level * (1 - threshold):
-                # Reversal: close back above level (or next candle does)
-                if closes[i] > level or (i + 1 < len(closes) and closes[i + 1] > level):
-                    vol_ratio = volumes[i] / avg_vol
-                    strength = min(vol_ratio, 3.0) / 3.0  # 0-1
-                    return {
-                        "swept": True,
-                        "level": float(level),
-                        "reversal_candle": int(i),
-                        "strength": float(strength),
-                        "time": times[i],
-                    }
-                break  # only look at the most recent sweep
-
-        return {"swept": False, "level": float(level), "reversal_candle": -1, "strength": 0.0, "time": None}
-
-    def detect_sweep_high(self, threshold: float = 0.005) -> Dict[str, Any]:
-        """Detect a sweep above the Asian high or prior swing high.
-
-        Symmetric to :meth:`detect_sweep_low`.
-
-        Returns
-        -------
-        dict
-            Same schema as :meth:`detect_sweep_low`.
-        """
-        asian = self.find_asian_range()
-        level = asian["high"]
-        if level <= 0:
-            return {"swept": False, "level": 0.0, "reversal_candle": -1, "strength": 0.0, "time": None}
-
-        lows = self.candles["low"].values
-        highs = self.candles["high"].values
-        closes = self.candles["close"].values
-        volumes = self.candles["volume"].values
-        times = self.candles.index
-        avg_vol = float(np.mean(volumes)) if np.mean(volumes) > 0 else 1.0
-
-        for i in range(len(closes) - 1, 1, -1):
-            if highs[i] > level * (1 + threshold):
-                if closes[i] < level or (i + 1 < len(closes) and closes[i + 1] < level):
-                    vol_ratio = volumes[i] / avg_vol
-                    strength = min(vol_ratio, 3.0) / 3.0
-                    return {
-                        "swept": True,
-                        "level": float(level),
-                        "reversal_candle": int(i),
-                        "strength": float(strength),
-                        "time": times[i],
-                    }
-                break
-
-        return {"swept": False, "level": float(level), "reversal_candle": -1, "strength": 0.0, "time": None}
-
-    def is_genuine_sweep(self, sweep: Dict[str, Any], volume_avg: float) -> bool:
-        """Validate whether a detected sweep is genuine (not a continuation).
-
-        A genuine sweep must satisfy:
-            1. **Quick reversal** — < 2 candles below/above the level.
-            2. **Volume spike** — sweep candle volume > 1.5x average.
-            3. **Strong reversal candle** — body of reversal candle > 50 % of range.
-
-        Parameters
-        ----------
-        sweep : dict
-            Output from ``detect_sweep_low`` or ``detect_sweep_high``.
-        volume_avg : float
-            Average volume over the recent lookback period.
-
-        Returns
-        -------
-        bool
-        """
-        if not sweep.get("swept", False):
-            return False
-
-        idx = sweep["reversal_candle"]
-        if idx < 0 or idx >= len(self.candles):
-            return False
-
-        # Volume check
-        sweep_vol = float(self.candles["volume"].iloc[idx])
-        if volume_avg > 0 and sweep_vol < 1.5 * volume_avg:
-            return False
-
-        # Strong reversal candle body
-        row = self.candles.iloc[idx]
-        candle_range = float(row["high"] - row["low"])
-        body = abs(float(row["close"] - row["open"]))
-        if candle_range > 0 and body / candle_range < 0.5:
-            return False
-
-        return True
-
-    def get_liquidity_levels(self, lookback: int = 20) -> List[Dict[str, Any]]:
-        """Aggregate liquidity targets from multiple sources.
-
-        Sources:
-            1. Asian session high / low
-            2. Equal highs / equal lows within the lookback window
-            3. Most recent swing high / swing low
-
-        Parameters
-        ----------
-        lookback : int
-            Candles to scan for equal highs/lows.
-
-        Returns
-        -------
-        List[dict]
-            Each dict: ``price``, ``type`` (``'high'`` | ``'low'``),
-            ``source`` (``'asian'`` | ``'equal'`` | ``'swing'``), ``strength``.
-        """
-        levels: List[Dict[str, Any]] = []
-        recent = self.candles.iloc[-lookback:]
-
-        # 1. Asian range
-        asian = self.find_asian_range(lookback)
-        levels.append({"price": asian["high"], "type": "high", "source": "asian", "strength": 0.8})
-        levels.append({"price": asian["low"], "type": "low", "source": "asian", "strength": 0.8})
-
-        # 2. Equal highs / lows (clusters within 0.1 %)
-        highs = recent["high"].values
-        lows = recent["low"].values
-        tol = np.mean(highs) * 0.001
-
-        # Simple cluster detection: count near-duplicates
-        for target in [highs, lows]:
-            level_type = "high" if target is highs else "low"
-            for i, price in enumerate(target):
-                count = np.sum(np.abs(target - price) < tol)
-                if count >= 2:  # at least 2 touches
-                    levels.append(
-                        {
-                            "price": float(price),
-                            "type": level_type,
-                            "source": "equal",
-                            "strength": min(count * 0.2, 1.0),
-                        }
-                    )
-
-        # Deduplicate by price (within tolerance)
-        unique_levels: List[Dict[str, Any]] = []
-        for lvl in levels:
-            is_new = True
-            for existing in unique_levels:
-                if abs(existing["price"] - lvl["price"]) < tol:
-                    is_new = False
-                    break
-            if is_new:
-                unique_levels.append(lvl)
-
-        logger.info("Found %d unique liquidity levels (lookback=%d)", len(unique_levels), lookback)
-        return unique_levels
+    def _check_previous_day_sweep(self, bias: str) -> Dict[str, Any]:
+        """Check for previous day high/low sweep."""
+        # Need at least 96 candles (24 hours on 15m) for previous day
+        if len(self.setup_candles) < 96:
+            return {"sweep_found": False}
+        
+        # Previous day (candles 24-48 hours ago)
+        prev_day = self.setup_candles.iloc[-96:-48]
+        if len(prev_day) == 0:
+            return {"sweep_found": False}
+        
+        pd_high = prev_day['high'].max()
+        pd_low = prev_day['low'].min()
+        
+        current = self.setup_candles.iloc[-1]
+        
+        if bias == 'bullish':
+            # Sweep of previous day low
+            if current['low'] < pd_low and current['close'] > pd_low:
+                strength = (pd_low - current['low']) / (current['high'] - current['low'])
+                return {
+                    "sweep_found": True,
+                    "sweep_type": "pdl",
+                    "strength": round(min(strength, 1.0), 2),
+                    "level": round(pd_low, 2),
+                    "price": round(current['close'], 2),
+                }
+        
+        if bias == 'bearish':
+            # Sweep of previous day high
+            if current['high'] > pd_high and current['close'] < pd_high:
+                strength = (current['high'] - pd_high) / (current['high'] - current['low'])
+                return {
+                    "sweep_found": True,
+                    "sweep_type": "pdh",
+                    "strength": round(min(strength, 1.0), 2),
+                    "level": round(pd_high, 2),
+                    "price": round(current['close'], 2),
+                }
+        
+        return {"sweep_found": False}

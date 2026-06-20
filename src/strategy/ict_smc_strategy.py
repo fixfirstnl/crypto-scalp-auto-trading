@@ -1,28 +1,46 @@
-"""Main ICT/SMC Strategy Orchestrator.
+"""ICTSMCStrategy: Main strategy orchestrator.
 
-Wires the full signal-generation pipeline:
+Wires together all ICT/SMC components (MarketStructure, OrderBlocks, FairValueGaps,
+LiquiditySweep) into a unified trading pipeline. The strategy operates across
+multiple timeframes:
 
-    HTF Bias (1H/4H) → Setup Scan (15m) → Entry Confirmation (5m/1m) → Signal
+- HTF (1H/4H): Bias via MarketStructure (BOS/CHoCH)
+- MTF (15m): Setup scan — liquidity sweep + OB/FVG confluence
+- LTF (5m): Entry zone refinement
+- Entry (1m): Confirmation via EMA cross + RSI + volume
 
-Each stage is isolated so the ConsensusEngine (BiasAgent → SignalAgent →
-RiskAgent → ExecAgent) can veto at any point.
+Entry Rules (Simplified):
+1. HTF bias aligned (bullish → long, bearish → short)
+2. Liquidity sweep (Asian range or equal highs/lows)
+3. Order Block + FVG confluence in premium/discount zone
+4. EMA 9/21 crossover confirmation
+5. RSI not overbought/oversold (30-70 zone)
+6. Volume spike (>1.5x average)
+
+Exit Rules:
+- Stop-loss: 5-15 pips below/above entry (or 1x ATR)
+- TP1: 33% @ 1R (risk amount)
+- TP2: 33% @ 2R
+- TP3: 34% trailing (runner)
+- Breakeven after TP1: move SL to entry + 1 pip
+- Trailing stop after TP2: 50% of the distance from entry to TP2
 
 Usage:
     strategy = ICTSMCStrategy(data_cache, indicator_engine)
-    signal = strategy.generate_signal("BTC/USDT:USDT")
-    if signal:
-        # pass to RiskAgent / ExecAgent
-        ...
+    setup = strategy.scan_for_setup('BTC/USDT:USDT', 'bullish', candles_15m, candles_5m)
+    if setup['signal'] != 'none':
+        entry = strategy.confirm_entry(setup, candles_1m, indicators)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
+from src.layer1_data import DataCache, IndicatorEngine
 from .market_structure import MarketStructure
 from .order_blocks import OrderBlocks
 from .fair_value_gaps import FairValueGaps
@@ -33,423 +51,326 @@ logger = logging.getLogger(__name__)
 
 class ICTSMCStrategy:
     """ICT/SMC hybrid scalping strategy orchestrator.
-
+    
     Parameters
     ----------
-    data_cache : Any
-        Data-layer cache object (e.g., Redis wrapper) that exposes
-        ``get_candles(symbol, timeframe) -> pd.DataFrame``.
-    indicator_engine : Any
-        Indicator calculator that exposes ``get(symbol, timeframe) -> dict``
-        with keys ``ema9``, ``ema21``, ``rsi``, ``vwap``, ``volume_avg``,
-        ``spread``, ``spread_avg``.
+    data_cache : DataCache
+        Layer-1 data cache for OHLCV retrieval.
+    indicator_engine : IndicatorEngine
+        Layer-1 indicator calculator.
     """
 
-    def __init__(self, data_cache: Any, indicator_engine: Any) -> None:
+    def __init__(
+        self,
+        data_cache: DataCache,
+        indicator_engine: IndicatorEngine,
+    ) -> None:
         self.data_cache = data_cache
         self.indicator_engine = indicator_engine
+        
+        # Strategy components
+        self.market_structure = None  # Created per-analysis
+        self.order_blocks = None
+        self.fvg = None
+        self.liquidity_sweep = None
 
-    # ------------------------------------------------------------------ #
-    #  Stage 1 — HTF Bias
-    # ------------------------------------------------------------------ #
-
-    def analyze_bias(self, symbol: str, htf_candles: pd.DataFrame) -> Dict[str, Any]:
-        """Determine the Higher-Timeframe market bias.
-
-        Uses :class:`MarketStructure` on 1H or 4H candles to detect BOS/CHoCH
-        and derive a bullish / bearish / neutral bias with confidence.
-
-        Parameters
-        ----------
-        symbol : str
-            Trading pair (e.g. ``'BTC/USDT:USDT'``).
-        htf_candles : pd.DataFrame
-            1H or 4H OHLCV DataFrame.
-
-        Returns
-        -------
-        dict
-            ``bias`` (``'bullish'`` | ``'bearish'`` | ``'neutral'``),
-            ``confidence`` (0.0-1.0), ``structure`` (raw MarketStructure output).
-        """
-        try:
-            ms = MarketStructure(htf_candles)
-            structure = ms.detect_structure(lookback=10)
-        except Exception as exc:
-            logger.error("MarketStructure failed for %s: %s", symbol, exc)
-            return {"bias": "neutral", "confidence": 0.0, "structure": {}}
-
-        bias = structure.get("bias", "neutral")
-        strength = structure.get("strength", 0.0)
-
-        # Confidence = structure strength * recency factor
-        last_bos = structure.get("last_bos")
-        last_choch = structure.get("last_choch")
-        recency = 0.5
-        if last_bos or last_choch:
-            max_idx = len(htf_candles) - 1
-            latest_event_idx = -1
-            if last_bos:
-                latest_event_idx = max(latest_event_idx, last_bos["index"])
-            if last_choch:
-                latest_event_idx = max(latest_event_idx, last_choch["index"])
-            if max_idx > 0 and latest_event_idx >= 0:
-                recency = latest_event_idx / max_idx
-
-        confidence = min(strength * recency * 2.0, 1.0)  # cap at 1.0
-
-        result = {
-            "bias": bias,
-            "confidence": float(confidence),
-            "structure": structure,
-        }
-        logger.info("HTF bias for %s: %s (confidence=%.2f)", symbol, bias, confidence)
-        return result
-
-    # ------------------------------------------------------------------ #
-    #  Stage 2 — Setup Scan
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Stage 1: Setup Scan (15m + 5m)
+    # ------------------------------------------------------------------
 
     def scan_for_setup(
         self,
         symbol: str,
-        bias: str,
-        setup_candles: pd.DataFrame,
-        entry_candles: pd.DataFrame,
+        bias: str,  # 'bullish' or 'bearish'
+        setup_candles: pd.DataFrame,  # 15m candles
+        entry_candles: pd.DataFrame,  # 5m candles
     ) -> Dict[str, Any]:
         """Scan for a valid ICT/SMC setup.
-
-        Pipeline:
-            1. Detect liquidity sweep on 15m (setup_candles).
-            2. Find OB + FVG confluence on 5m (entry_candles).
-            3. Check LTF confirmation on 1m/5m.
-
+        
         Parameters
         ----------
         symbol : str
             Trading pair.
         bias : str
-            HTF bias (``'bullish'`` | ``'bearish'`` | ``'neutral'``).
+            'bullish' or 'bearish' from HTF analysis.
         setup_candles : pd.DataFrame
-            15m OHLCV — used for liquidity sweep detection.
+            15m OHLCV candles for setup scan.
         entry_candles : pd.DataFrame
-            5m OHLCV — used for OB/FVG confluence and entry zone.
-
+            5m OHLCV candles for entry zone refinement.
+        
         Returns
         -------
         dict
-            ``signal`` (``'long'`` | ``'short'`` | ``'none'``),
-            ``setup`` (detailed dict if signal != none).
+            Setup result with signal, confluence score, and details.
         """
-        if bias == "neutral":
-            logger.info("Setup scan for %s: neutral bias — no trade.", symbol)
-            return {"signal": "none", "setup": {}}
-
-        # --- Step 1: Liquidity Sweep (15m) ---
-        liq = LiquiditySweep(setup_candles)
-        if bias == "bullish":
-            sweep = liq.detect_sweep_low(threshold=0.005)
-            expected_direction = "long"
-        else:
-            sweep = liq.detect_sweep_high(threshold=0.005)
-            expected_direction = "short"
-
-        if not sweep.get("swept", False):
-            logger.info("Setup scan for %s: no liquidity sweep detected.", symbol)
-            return {"signal": "none", "setup": {}}
-
-        avg_vol_15m = float(np.mean(setup_candles["volume"].values))
-        if not liq.is_genuine_sweep(sweep, avg_vol_15m):
-            logger.info("Setup scan for %s: sweep not genuine (volume/body check failed).", symbol)
-            return {"signal": "none", "setup": {}}
-
-        # --- Step 2: OB + FVG Confluence (5m) ---
-        obs = OrderBlocks(entry_candles)
-        fvgs = FairValueGaps(entry_candles)
-
-        if bias == "bullish":
-            ob_list = obs.find_bullish_order_blocks()
-            fvg_list = fvgs.find_bullish_fvgs()
-        else:
-            ob_list = obs.find_bearish_order_blocks()
-            fvg_list = fvgs.find_bearish_fvgs()
-
-        # Build a dummy market_structure for scoring (lightweight)
-        ms_dummy = {"bias": bias}
-        confluences = obs.find_ob_fvg_confluence(
-            bullish=(bias == "bullish"), fvgs=fvg_list
-        )
-        if not confluences:
-            logger.info("Setup scan for %s: no OB+FVG confluence found.", symbol)
-            return {"signal": "none", "setup": {}}
-
-        # Pick the highest-scored confluence zone
-        best = confluences[0]
-        zone = best["confluence_zone"]
-        zone_mid = (zone["top"] + zone["bottom"]) / 2.0
-
-        # --- Step 3: LTF Confirmation (check on entry_candles) ---
-        # Check if price is currently near the confluence zone
-        current_price = float(entry_candles["close"].iloc[-1])
-        zone_tol = current_price * 0.005  # 0.5 % of price
-        price_near_zone = abs(current_price - zone_mid) <= zone_tol
-
-        if not price_near_zone:
-            logger.info(
-                "Setup scan for %s: price %.2f too far from zone %.2f (tol=%.2f).",
-                symbol, current_price, zone_mid, zone_tol,
-            )
-            return {"signal": "none", "setup": {}}
-
+        if setup_candles.empty or entry_candles.empty:
+            return {"signal": "none", "reason": "Insufficient candle data"}
+        
+        # Initialize components
+        self.market_structure = MarketStructure(setup_candles)
+        self.order_blocks = OrderBlocks(setup_candles)
+        self.fvg = FairValueGaps(setup_candles)
+        self.liquidity_sweep = LiquiditySweep(setup_candles, entry_candles)
+        
+        # 1. Detect market structure (BOS/CHoCH on 15m)
+        structure = self.market_structure.detect_structure(lookback=10)
+        
+        # 2. Find order blocks
+        obs = self.order_blocks.find_order_blocks()
+        
+        # 3. Find fair value gaps
+        fvgs = self.fvg.find_fvgs()
+        
+        # 4. Check for liquidity sweep
+        sweep = self.liquidity_sweep.check_sweep(bias=bias)
+        
+        # 5. Check OB + FVG confluence
+        confluence = self._check_confluence(obs, fvgs, bias)
+        
+        # 6. Determine if we have a valid setup
+        if not sweep.get('sweep_found', False):
+            return {"signal": "none", "reason": "No liquidity sweep detected", "setup": {}}
+        
+        if confluence['score'] < 2:  # Need at least 2 confluence factors
+            return {"signal": "none", "reason": "Insufficient confluence", "setup": {}}
+        
+        # Build setup result
+        signal = "long" if bias == "bullish" else "short"
+        
         setup = {
-            "signal": expected_direction,
+            "signal": signal,
+            "bias": bias,
+            "structure": structure,
             "sweep": sweep,
-            "confluence": best,
-            "zone": zone,
-            "zone_mid": float(zone_mid),
-            "current_price": float(current_price),
-            "obs_count": len(ob_list),
-            "fvgs_count": len(fvg_list),
+            "confluence": confluence,
+            "order_blocks": obs,
+            "fvgs": fvgs,
+            "setup": {
+                "entry_zone": confluence.get('entry_zone', {}),
+                "stop_loss": confluence.get('stop_loss', 0),
+                "take_profit_1": confluence.get('take_profit_1', 0),
+                "take_profit_2": confluence.get('take_profit_2', 0),
+                "take_profit_3": confluence.get('take_profit_3', 0),
+            },
         }
+        
         logger.info(
-            "Setup scan for %s: %s signal detected (zone=%.2f, score=%.1f)",
-            symbol, expected_direction, zone_mid, best["score"],
+            "Setup scan: %s signal=%s confluence=%d/5",
+            symbol, signal, confluence['score']
         )
-        return {"signal": expected_direction, "setup": setup}
+        return setup
 
-    # ------------------------------------------------------------------ #
-    #  Stage 3 — Entry Confirmation
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Stage 2: Entry Confirmation (1m)
+    # ------------------------------------------------------------------
 
     def confirm_entry(
         self,
         signal: Dict[str, Any],
-        ltf_candles: pd.DataFrame,
+        ltf_candles: pd.DataFrame,  # 1m candles
         indicators: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Confirm entry with LTF indicator checks.
-
-        Checks:
-            - EMA crossover (9 > 21 for longs, 9 < 21 for shorts)
-            - RSI not extreme (longs: RSI > 40; shorts: RSI < 60)
-            - Volume > 1.5x average
-            - Spread < 2x average
-
+        """Confirm entry on LTF with indicators.
+        
         Parameters
         ----------
         signal : dict
-            Output of :meth:`scan_for_setup`.
+            Setup result from scan_for_setup.
         ltf_candles : pd.DataFrame
-            1m or 5m OHLCV for LTF confirmation.
+            1m OHLCV candles.
         indicators : dict
-            From ``indicator_engine.get(symbol, timeframe)``:
-            ``ema9``, ``ema21``, ``rsi``, ``volume_avg``, ``spread``, ``spread_avg``.
-
+            Indicator values from IndicatorEngine.
+        
         Returns
         -------
         dict
-            ``confirmed`` (bool), ``entry_price``, ``stop_loss``,
-            ``take_profit_1``, ``take_profit_2``, ``take_profit_3``,
-            ``size`` (placeholder — RiskAgent will override),
-            ``reason`` (str).
+            Entry confirmation with price, SL, TPs, and confirmation status.
         """
-        if signal.get("signal", "none") == "none":
-            return {"confirmed": False, "reason": "No signal to confirm"}
-
-        direction = signal["signal"]  # 'long' or 'short'
-        setup = signal["setup"]
-        zone = setup["zone"]
-        zone_mid = setup["zone_mid"]
-
-        # Indicator extraction with safe defaults
-        ema9 = indicators.get("ema9", 0.0)
-        ema21 = indicators.get("ema21", 0.0)
-        rsi = indicators.get("rsi", 50.0)
-        vol_avg = indicators.get("volume_avg", 0.0)
-        spread = indicators.get("spread", 0.0)
-        spread_avg = indicators.get("spread_avg", 0.0)
-
-        current_price = float(ltf_candles["close"].iloc[-1])
-        current_vol = float(ltf_candles["volume"].iloc[-1])
-
-        reasons: List[str] = []
-
-        # 1. EMA cross check
-        ema_aligned = (direction == "long" and ema9 > ema21) or (direction == "short" and ema9 < ema21)
-        if not ema_aligned:
-            reasons.append(f"EMA not aligned (9={ema9:.2f}, 21={ema21:.2f})")
-
-        # 2. RSI check
-        if direction == "long" and rsi < 40:
-            reasons.append(f"RSI too low for long ({rsi:.1f})")
-        if direction == "short" and rsi > 60:
-            reasons.append(f"RSI too high for short ({rsi:.1f})")
-
-        # 3. Volume check
-        if vol_avg > 0 and current_vol < 1.5 * vol_avg:
-            reasons.append(f"Volume too low ({current_vol:.0f} < {1.5*vol_avg:.0f})")
-
-        # 4. Spread check
-        if spread_avg > 0 and spread > 2.0 * spread_avg:
-            reasons.append(f"Spread too wide ({spread:.4f} > {2.0*spread_avg:.4f})")
-
-        if reasons:
-            reason_str = "; ".join(reasons)
-            logger.info("Entry NOT confirmed for %s: %s", direction, reason_str)
-            return {"confirmed": False, "reason": reason_str}
-
-        # --- Entry price & Stop Loss ---
-        # Entry: limit order at zone_mid (or market on strong momentum)
-        entry_price = zone_mid
-
-        # SL: below OB low for longs, above OB high for shorts
-        ob = setup["confluence"]["ob"]
-        if direction == "long":
-            stop_loss = min(ob["low"], zone["bottom"]) * 0.999  # 0.1 % buffer below
-        else:
-            stop_loss = max(ob["high"], zone["top"]) * 1.001  # 0.1 % buffer above
-
-        # R-multiple targets
-        r_targets = self.get_r_multiples(entry_price, stop_loss, direction)
-
+        if ltf_candles.empty or not indicators:
+            return {"confirmed": False, "reason": "No LTF data or indicators"}
+        
+        setup = signal.get('setup', {})
+        entry_zone = setup.get('entry_zone', {})
+        
+        # Get latest indicator values
+        ema_9 = indicators.get('ema9', 0)
+        ema_21 = indicators.get('ema21', 0)
+        rsi = indicators.get('rsi', 50)
+        volume_avg = indicators.get('volume_avg', 0)
+        spread = indicators.get('spread', 0)
+        spread_avg = indicators.get('spread_avg', 0)
+        
+        # Current price
+        current_price = ltf_candles['close'].iloc[-1]
+        
+        # 1. EMA Crossover confirmation
+        ema_cross = self._check_ema_cross(ltf_candles, signal['signal'])
+        
+        # 2. RSI filter (not overbought/oversold)
+        rsi_valid = 30 < rsi < 70
+        
+        # 3. Volume confirmation (>1.5x average)
+        current_volume = ltf_candles['volume'].iloc[-1] if 'volume' in ltf_candles.columns else 0
+        volume_spike = current_volume > volume_avg * 1.5 if volume_avg > 0 else False
+        
+        # 4. Spread check (not too wide)
+        spread_ok = spread < spread_avg * 2 if spread_avg > 0 else True
+        
+        # 5. Price in entry zone
+        in_zone = self._price_in_zone(current_price, entry_zone)
+        
+        # All confirmations must pass
+        confirmations = {
+            'ema_cross': ema_cross,
+            'rsi_valid': rsi_valid,
+            'volume_spike': volume_spike,
+            'spread_ok': spread_ok,
+            'in_zone': in_zone,
+        }
+        
+        all_confirmed = all(confirmations.values())
+        
+        if not all_confirmed:
+            failed = [k for k, v in confirmations.items() if not v]
+            return {
+                "confirmed": False,
+                "reason": f"Entry confirmation failed: {', '.join(failed)}",
+                "confirmations": confirmations,
+            }
+        
+        # Calculate entry, SL, TPs
+        entry_price = current_price
+        stop_loss = setup.get('stop_loss', entry_price * 0.99)  # Default 1% SL
+        
+        # Risk:Reward ratios
+        risk = abs(entry_price - stop_loss)
+        tp1 = entry_price + risk * 1 if signal['signal'] == 'long' else entry_price - risk * 1
+        tp2 = entry_price + risk * 2 if signal['signal'] == 'long' else entry_price - risk * 2
+        tp3 = entry_price + risk * 3 if signal['signal'] == 'long' else entry_price - risk * 3
+        
         result = {
             "confirmed": True,
-            "entry_price": float(entry_price),
-            "stop_loss": float(stop_loss),
-            "take_profit_1": r_targets["tp1"],
-            "take_profit_2": r_targets["tp2"],
-            "take_profit_3": r_targets["tp3"],
-            "size": 0.0,  # placeholder — RiskAgent calculates this
-            "reason": "All checks passed",
+            "entry_price": round(entry_price, 2),
+            "stop_loss": round(stop_loss, 2),
+            "take_profit_1": round(tp1, 2),
+            "take_profit_2": round(tp2, 2),
+            "take_profit_3": round(tp3, 2),
+            "confirmations": confirmations,
+            "current_price": current_price,
+            "rsi": rsi,
+            "volume_ratio": round(current_volume / volume_avg, 2) if volume_avg > 0 else 0,
         }
+        
         logger.info(
-            "Entry CONFIRMED: %s @ %.2f, SL=%.2f, TP1=%.2f, TP2=%.2f, TP3=%.2f",
-            direction, entry_price, stop_loss, r_targets["tp1"], r_targets["tp2"], r_targets["tp3"],
+            "Entry confirmed: entry=%.2f SL=%.2f TP1=%.2f TP2=%.2f TP3=%.2f",
+            entry_price, stop_loss, tp1, tp2, tp3
         )
         return result
 
-    # ------------------------------------------------------------------ #
-    #  Full Pipeline
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def generate_signal(self, symbol: str) -> Dict[str, Any] | None:
-        """Orchestrate the full signal-generation pipeline.
-
-        1. Fetch HTF (1H/4H) candles → HTF bias.
-        2. Fetch 15m setup candles → liquidity sweep.
-        3. Fetch 5m entry candles → OB/FVG confluence.
-        4. Fetch 1m LTF candles + indicators → entry confirmation.
-        5. Return complete signal or None.
-
-        Parameters
-        ----------
-        symbol : str
-            Trading pair (e.g. ``'BTC/USDT:USDT'``).
-
-        Returns
-        -------
-        dict or None
-            Complete signal dict if all stages pass, otherwise ``None``.
+    def _check_confluence(
+        self,
+        obs: list,
+        fvgs: list,
+        bias: str,
+    ) -> Dict[str, Any]:
+        """Check for OB + FVG confluence and score it.
+        
+        Returns:
+            dict with 'score' (0-5), 'entry_zone', 'stop_loss', 'take_profits'
         """
-        logger.info("Generating signal for %s ...", symbol)
-
-        # 1. HTF Bias
-        try:
-            htf_candles = self.data_cache.get_candles(symbol, "1h")
-        except Exception as exc:
-            logger.error("Failed to fetch HTF candles for %s: %s", symbol, exc)
-            return None
-
-        bias_result = self.analyze_bias(symbol, htf_candles)
-        if bias_result["bias"] == "neutral" or bias_result["confidence"] < 0.3:
-            logger.info("Signal for %s: insufficient bias confidence.", symbol)
-            return None
-
-        # 2. Setup Scan (15m)
-        try:
-            setup_candles = self.data_cache.get_candles(symbol, "15m")
-            entry_candles = self.data_cache.get_candles(symbol, "5m")
-        except Exception as exc:
-            logger.error("Failed to fetch setup candles for %s: %s", symbol, exc)
-            return None
-
-        setup_result = self.scan_for_setup(
-            symbol, bias_result["bias"], setup_candles, entry_candles
-        )
-        if setup_result["signal"] == "none":
-            return None
-
-        # 3. Entry Confirmation (1m LTF)
-        try:
-            ltf_candles = self.data_cache.get_candles(symbol, "1m")
-            indicators = self.indicator_engine.get(symbol, "1m")
-        except Exception as exc:
-            logger.error("Failed to fetch LTF data for %s: %s", symbol, exc)
-            return None
-
-        entry_result = self.confirm_entry(setup_result, ltf_candles, indicators)
-        if not entry_result["confirmed"]:
-            return None
-
-        # Assemble final signal
-        final_signal = {
-            "symbol": symbol,
-            "direction": setup_result["signal"],
-            "bias": bias_result["bias"],
-            "bias_confidence": bias_result["confidence"],
-            "entry_price": entry_result["entry_price"],
-            "stop_loss": entry_result["stop_loss"],
-            "take_profit_1": entry_result["take_profit_1"],
-            "take_profit_2": entry_result["take_profit_2"],
-            "take_profit_3": entry_result["take_profit_3"],
-            "size": entry_result["size"],  # RiskAgent will override
-            "setup": setup_result["setup"],
-            "reason": entry_result["reason"],
-            "timestamp": pd.Timestamp.utcnow().isoformat(),
+        score = 0
+        entry_zone = {"min": 0, "max": 0}
+        stop_loss = 0
+        tp1 = tp2 = tp3 = 0
+        
+        # Factor 1: Has valid OB
+        if obs and len(obs) > 0:
+            score += 1
+            # Use most recent OB as entry zone
+            ob = obs[-1]
+            entry_zone = {
+                "min": min(ob.get('high', 0), ob.get('low', 0)),
+                "max": max(ob.get('high', 0), ob.get('low', 0)),
+            }
+            # SL beyond OB
+            if bias == 'bullish':
+                stop_loss = ob.get('low', 0) * 0.999
+            else:
+                stop_loss = ob.get('high', 0) * 1.001
+        
+        # Factor 2: Has valid FVG
+        if fvgs and len(fvgs) > 0:
+            score += 1
+            fvg = fvgs[-1]
+            # FVG overlaps with OB zone
+            if entry_zone['min'] > 0:
+                fvg_min = min(fvg.get('high', 0), fvg.get('low', 0))
+                fvg_max = max(fvg.get('high', 0), fvg.get('low', 0))
+                overlap = not (fvg_max < entry_zone['min'] or fvg_min > entry_zone['max'])
+                if overlap:
+                    score += 1  # Bonus for overlap
+                    entry_zone = {
+                        "min": max(entry_zone['min'], fvg_min),
+                        "max": min(entry_zone['max'], fvg_max),
+                    }
+        
+        # Factor 3: Structure aligned
+        if bias in ['bullish', 'bearish']:
+            score += 1
+        
+        # Factor 4: Entry zone is valid
+        if entry_zone['min'] > 0 and entry_zone['max'] > entry_zone['min']:
+            score += 1
+        
+        # Calculate TPs based on entry zone midpoint
+        if entry_zone['min'] > 0:
+            mid = (entry_zone['min'] + entry_zone['max']) / 2
+            risk = abs(mid - stop_loss) if stop_loss > 0 else mid * 0.01
+            if bias == 'bullish':
+                tp1 = mid + risk * 1
+                tp2 = mid + risk * 2
+                tp3 = mid + risk * 3
+            else:
+                tp1 = mid - risk * 1
+                tp2 = mid - risk * 2
+                tp3 = mid - risk * 3
+        
+        return {
+            'score': score,
+            'entry_zone': entry_zone,
+            'stop_loss': round(stop_loss, 2),
+            'take_profit_1': round(tp1, 2),
+            'take_profit_2': round(tp2, 2),
+            'take_profit_3': round(tp3, 2),
         }
-        logger.info("Final signal generated for %s: %s", symbol, final_signal)
-        return final_signal
 
-    # ------------------------------------------------------------------ #
-    #  Utilities
-    # ------------------------------------------------------------------ #
-
-    def get_r_multiples(
-        self, entry: float, stop_loss: float, direction: str
-    ) -> Dict[str, float]:
-        """Calculate 1R, 2R, and 3R profit targets.
-
-        Parameters
-        ----------
-        entry : float
-            Entry price.
-        stop_loss : float
-            Stop-loss price.
-        direction : str
-            ``'long'`` or ``'short'``.
-
-        Returns
-        -------
-        dict
-            ``tp1`` (1R), ``tp2`` (2R), ``tp3`` (3R).
+    def _check_ema_cross(self, candles: pd.DataFrame, signal: str) -> bool:
+        """Check for EMA 9/21 crossover confirmation.
+        
+        For long: EMA 9 > EMA 21 and price > EMA 9
+        For short: EMA 9 < EMA 21 and price < EMA 9
         """
-        if direction == "long":
-            risk = entry - stop_loss
-            if risk <= 0:
-                logger.warning("Long SL %.4f is above entry %.4f — invalid.", stop_loss, entry)
-                risk = entry * 0.005  # fallback 0.5 % risk
-            return {
-                "tp1": float(entry + risk * 1.0),
-                "tp2": float(entry + risk * 2.0),
-                "tp3": float(entry + risk * 3.0),
-            }
-        else:  # short
-            risk = stop_loss - entry
-            if risk <= 0:
-                logger.warning("Short SL %.4f is below entry %.4f — invalid.", stop_loss, entry)
-                risk = entry * 0.005
-            return {
-                "tp1": float(entry - risk * 1.0),
-                "tp2": float(entry - risk * 2.0),
-                "tp3": float(entry - risk * 3.0),
-            }
+        if len(candles) < 21:
+            return False
+        
+        ema_9 = candles['close'].ewm(span=9, adjust=False).mean()
+        ema_21 = candles['close'].ewm(span=21, adjust=False).mean()
+        
+        current_price = candles['close'].iloc[-1]
+        ema_9_current = ema_9.iloc[-1]
+        ema_21_current = ema_21.iloc[-1]
+        
+        if signal == 'long':
+            return ema_9_current > ema_21_current and current_price > ema_9_current
+        else:
+            return ema_9_current < ema_21_current and current_price < ema_9_current
+
+    def _price_in_zone(self, price: float, zone: Dict[str, float]) -> bool:
+        """Check if price is within the entry zone."""
+        if not zone or zone.get('min', 0) == 0:
+            return True  # No zone defined = always valid
+        return zone['min'] <= price <= zone['max']

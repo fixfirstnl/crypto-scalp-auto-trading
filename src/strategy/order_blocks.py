@@ -1,344 +1,156 @@
-"""Order Block Identification — Institutional Supply/Demand Zones.
+"""OrderBlocks: Identify and score Order Blocks (OB) for ICT/SMC analysis.
 
-Order Blocks (OBs) are the last opposing candle before an aggressive,
-structure-breaking move.  This module identifies bullish and bearish OBs,
-scores them for quality, and finds confluence with Fair Value Gaps.
+Order Blocks are the last opposing candle before a strong move, representing
+institutional supply/demand zones. This module identifies:
 
-All heavy lifting is vectorised via pandas/numpy.
+- Bullish OB: Last bearish candle before a strong bullish move
+- Bearish OB: Last bullish candle before a strong bearish move
+- OB scoring: Based on move strength, proximity to current price, and confluence
+
+Usage:
+    ob = OrderBlocks(candles)
+    blocks = ob.find_order_blocks()
+    # blocks = [{type, high, low, score, index, strength}, ...]
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any
+from typing import Dict, Any, List
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 class OrderBlocks:
-    """Identify and score institutional Order Blocks.
-
+    """Identify and score Order Blocks from OHLCV data.
+    
     Parameters
     ----------
     candles : pd.DataFrame
-        Must contain ``open``, ``high``, ``low``, ``close``, ``volume``.
+        OHLCV DataFrame with columns: open, high, low, close, volume
     """
 
     def __init__(self, candles: pd.DataFrame) -> None:
-        if not isinstance(candles, pd.DataFrame):
-            raise TypeError("candles must be a pandas DataFrame")
-        required = {"open", "high", "low", "close", "volume"}
-        missing = required - set(candles.columns)
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-        self.candles = candles.copy()
-        self._bullish_obs: List[Dict[str, Any]] = []
-        self._bearish_obs: List[Dict[str, Any]] = []
+        self.candles = candles
+        self.opens = candles['open'].values
+        self.highs = candles['high'].values
+        self.lows = candles['low'].values
+        self.closes = candles['close'].values
 
-    # ------------------------------------------------------------------ #
-    #  Helpers
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _candle_body(open_: float, close: float) -> float:
-        return abs(close - open_)
-
-    @staticmethod
-    def _is_bullish(open_: float, close: float) -> bool:
-        return close > open_
-
-    @staticmethod
-    def _is_bearish(open_: float, close: float) -> bool:
-        return close < open_
-
-    # ------------------------------------------------------------------ #
-    #  Public API
-    # ------------------------------------------------------------------ #
-
-    def find_bullish_order_blocks(self, min_body_size: float = 0.001) -> List[Dict[str, Any]]:
-        """Find bullish Order Blocks.
-
-        A bullish OB is the **last bearish candle** before a strong bullish
-        impulse that breaks a prior swing high (BOS).  The OB body forms a
-        demand zone where institutional buyers may have entered.
-
+    def find_order_blocks(self, lookback: int = 20) -> List[Dict[str, Any]]:
+        """Find order blocks in recent candles.
+        
         Parameters
         ----------
-        min_body_size : float
-            Minimum candle body as a fraction of price (default 0.1 %).
-
+        lookback : int, default 20
+            Number of candles to analyze.
+        
         Returns
         -------
-        List[dict]
-            Each dict: ``index``, ``open``, ``high``, ``low``, ``close``,
-            ``strength`` (0-100), ``time``, ``body_size``, ``times_tested``.
+        list
+            List of order block dictionaries.
         """
-        opens = self.candles["open"].values
-        highs = self.candles["high"].values
-        lows = self.candles["low"].values
-        closes = self.candles["close"].values
-        volumes = self.candles["volume"].values
-        times = self.candles.index
-        avg_vol = float(np.mean(volumes)) if np.mean(volumes) > 0 else 1.0
-
-        obs: List[Dict[str, Any]] = []
-
-        # Vectorised: find bearish candles
-        bearish = closes < opens
-        # Find impulsive bullish moves (3-candle displacement)
-        for i in range(3, len(closes) - 1):
-            if not bearish[i]:
-                continue
-
-            # Body size check
-            body = self._candle_body(opens[i], closes[i])
-            if body / closes[i] < min_body_size:
-                continue
-
-            # Displacement: next 3 candles show strong bullish move
-            # Simplified: close[i+3] > high[i] and close[i+3] > close[i+2] > close[i+1]
-            if not (closes[i + 3] > highs[i] and closes[i + 3] > closes[i + 2] > closes[i + 1]):
-                continue
-
-            # Volume confirmation on the displacement candle
-            displacement_vol = volumes[i + 3]
-            vol_strength = min(displacement_vol / avg_vol, 3.0) / 3.0  # 0-1
-
-            # Strength scoring (0-100)
-            strength = 50.0 + (vol_strength * 50.0)
-
-            ob = {
-                "index": int(i),
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i]),
-                "strength": float(strength),
-                "time": times[i],
-                "body_size": float(body),
-                "times_tested": 0,
-            }
-            obs.append(ob)
-
-        self._bullish_obs = obs
-        logger.info("Found %d bullish Order Blocks (min_body=%.4f)", len(obs), min_body_size)
-        return obs
-
-    def find_bearish_order_blocks(self, min_body_size: float = 0.001) -> List[Dict[str, Any]]:
-        """Find bearish Order Blocks.
-
-        A bearish OB is the **last bullish candle** before a strong bearish
-        impulse that breaks a prior swing low (BOS).  The OB body forms a
-        supply zone.
-
-        Parameters & Returns — same as :meth:`find_bullish_order_blocks`.
-        """
-        opens = self.candles["open"].values
-        highs = self.candles["high"].values
-        lows = self.candles["low"].values
-        closes = self.candles["close"].values
-        volumes = self.candles["volume"].values
-        times = self.candles.index
-        avg_vol = float(np.mean(volumes)) if np.mean(volumes) > 0 else 1.0
-
-        obs: List[Dict[str, Any]] = []
-        bullish = closes > opens
-
-        for i in range(3, len(closes) - 1):
-            if not bullish[i]:
-                continue
-
-            body = self._candle_body(opens[i], closes[i])
-            if body / closes[i] < min_body_size:
-                continue
-
-            # Displacement: next 3 candles show strong bearish move
-            if not (closes[i + 3] < lows[i] and closes[i + 3] < closes[i + 2] < closes[i + 1]):
-                continue
-
-            displacement_vol = volumes[i + 3]
-            vol_strength = min(displacement_vol / avg_vol, 3.0) / 3.0
-            strength = 50.0 + (vol_strength * 50.0)
-
-            ob = {
-                "index": int(i),
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i]),
-                "strength": float(strength),
-                "time": times[i],
-                "body_size": float(body),
-                "times_tested": 0,
-            }
-            obs.append(ob)
-
-        self._bearish_obs = obs
-        logger.info("Found %d bearish Order Blocks (min_body=%.4f)", len(obs), min_body_size)
-        return obs
-
-    def score_order_block(self, ob: Dict[str, Any], market_structure: Dict[str, Any]) -> float:
-        """Score an Order Block for quality (0-100).
-
-        Scoring criteria:
-            1. **HTF bias alignment** (+30 pts) — OB direction matches bias.
-            2. **Displacement strength** (+25 pts) — body size of the move.
-            3. **Volume at creation** (+25 pts) — high volume = conviction.
-            4. **Times tested** (+20 pts) — fewer touches = fresher zone.
-
-        Parameters
-        ----------
-        ob : dict
-            Order block dict from the find_* methods.
-        market_structure : dict
-            Output of :meth:`MarketStructure.detect_structure`.
-
-        Returns
-        -------
-        float
-            Composite score 0-100.
-        """
-        score = 0.0
-        bias = market_structure.get("bias", "neutral")
-
-        # 1. Bias alignment
-        is_bullish = ob["close"] > ob["open"]
-        if (bias == "bullish" and not is_bullish) or (bias == "bearish" and is_bullish):
-            score += 30.0
-        elif bias == "neutral":
-            score += 15.0
-
-        # 2. Displacement strength (body size relative to price)
-        body_ratio = ob["body_size"] / ob["close"]
-        score += min(body_ratio * 1000, 25.0)  # cap at 25
-
-        # 3. Volume strength (already baked into ob["strength"])
-        vol_score = (ob["strength"] - 50.0) / 50.0 * 25.0 if ob["strength"] >= 50.0 else 0.0
-        score += min(vol_score, 25.0)
-
-        # 4. Times tested (fewer = better)
-        tested = ob.get("times_tested", 0)
-        score += max(20.0 - tested * 5.0, 0.0)
-
-        return min(score, 100.0)
-
-    def find_ob_fvg_confluence(
-        self, bullish: bool = True, fvgs: List[Dict[str, Any]] | None = None
-    ) -> List[Dict[str, Any]]:
-        """Find overlapping zones where Order Block and FVG coincide.
-
-        Confluence is the highest-probability entry zone in ICT/SMC.
-
-        Parameters
-        ----------
-        bullish : bool
-            Scan bullish OBs + bullish FVGs if True, else bearish.
-        fvgs : list or None
-            FVG dicts from :class:`FairValueGaps`.  If None, the caller
-            must have provided them externally; this module does not import
-            FVG to keep dependencies loose.
-
-        Returns
-        -------
-        List[dict]
-            Each dict: ``ob`` (the OB dict), ``fvg`` (the FVG dict),
-            ``confluence_zone`` (top, bottom), ``score`` (0-100).
-        """
-        if fvgs is None:
-            logger.warning("No FVGs provided for confluence scan; returning empty.")
+        if len(self.candles) < lookback + 5:
             return []
+        
+        recent = self.candles.tail(lookback).reset_index(drop=True)
+        blocks = []
+        
+        for i in range(2, len(recent) - 3):
+            # Check for bullish OB (bearish candle before strong bullish move)
+            if self._is_bullish_ob(recent, i):
+                block = self._create_block(recent, i, 'bullish')
+                if block:
+                    blocks.append(block)
+            
+            # Check for bearish OB (bullish candle before strong bearish move)
+            if self._is_bearish_ob(recent, i):
+                block = self._create_block(recent, i, 'bearish')
+                if block:
+                    blocks.append(block)
+        
+        # Sort by score (descending)
+        blocks.sort(key=lambda x: x['score'], reverse=True)
+        return blocks[:5]  # Return top 5
 
-        obs = self._bullish_obs if bullish else self._bearish_obs
-        confluences: List[Dict[str, Any]] = []
+    def _is_bullish_ob(self, candles: pd.DataFrame, idx: int) -> bool:
+        """Check if candle at idx is a bullish order block."""
+        if idx < 2 or idx >= len(candles) - 3:
+            return False
+        
+        # The OB candle should be bearish (close < open)
+        if candles['close'].iloc[idx] >= candles['open'].iloc[idx]:
+            return False
+        
+        # Next 1-3 candles should be strongly bullish
+        next_candles = candles.iloc[idx + 1:idx + 4]
+        bull_count = sum(next_candles['close'] > next_candles['open'])
+        
+        if bull_count < 2:
+            return False
+        
+        # The move should be significant (>1%)
+        move = (next_candles['high'].max() - candles['close'].iloc[idx]) / candles['close'].iloc[idx]
+        return move > 0.01
 
-        for ob in obs:
-            ob_top = max(ob["open"], ob["close"])
-            ob_bottom = min(ob["open"], ob["close"])
+    def _is_bearish_ob(self, candles: pd.DataFrame, idx: int) -> bool:
+        """Check if candle at idx is a bearish order block."""
+        if idx < 2 or idx >= len(candles) - 3:
+            return False
+        
+        # The OB candle should be bullish (close > open)
+        if candles['close'].iloc[idx] <= candles['open'].iloc[idx]:
+            return False
+        
+        # Next 1-3 candles should be strongly bearish
+        next_candles = candles.iloc[idx + 1:idx + 4]
+        bear_count = sum(next_candles['close'] < next_candles['open'])
+        
+        if bear_count < 2:
+            return False
+        
+        # The move should be significant (>1%)
+        move = (candles['close'].iloc[idx] - next_candles['low'].min()) / candles['close'].iloc[idx]
+        return move > 0.01
 
-            for fvg in fvgs:
-                fvg_top = fvg["top"]
-                fvg_bottom = fvg["bottom"]
-
-                # Overlap check
-                overlap_top = min(ob_top, fvg_top)
-                overlap_bottom = max(ob_bottom, fvg_bottom)
-                if overlap_top > overlap_bottom:
-                    overlap_size = overlap_top - overlap_bottom
-                    ob_size = ob_top - ob_bottom
-                    fvg_size = fvg_top - fvg_bottom
-
-                    # Confluence score: % overlap relative to both zones
-                    ob_pct = overlap_size / ob_size if ob_size > 0 else 0
-                    fvg_pct = overlap_size / fvg_size if fvg_size > 0 else 0
-                    score = (ob_pct + fvg_pct) * 50.0  # 0-100
-
-                    confluences.append(
-                        {
-                            "ob": ob,
-                            "fvg": fvg,
-                            "confluence_zone": {
-                                "top": float(overlap_top),
-                                "bottom": float(overlap_bottom),
-                            },
-                            "score": float(min(score, 100.0)),
-                        }
-                    )
-
-        # Sort by score descending
-        confluences.sort(key=lambda x: x["score"], reverse=True)
-        logger.info(
-            "Found %d OB+FVG confluences (bullish=%s)", len(confluences), bullish
-        )
-        return confluences
-
-    def get_nearest_ob(self, price: float, bullish: bool = True) -> Dict[str, Any] | None:
-        """Return the nearest active Order Block to the current price.
-
-        Parameters
-        ----------
-        price : float
-            Current market price.
-        bullish : bool
-            If True, search bullish OBs; else bearish.
-
-        Returns
-        -------
-        dict or None
-            The closest OB dict, or None if no OBs exist.
-        """
-        obs = self._bullish_obs if bullish else self._bearish_obs
-        if not obs:
-            return None
-
-        # Distance to OB mid-point
-        def dist(ob: Dict[str, Any]) -> float:
-            mid = (ob["open"] + ob["close"]) / 2.0
-            return abs(price - mid)
-
-        return min(obs, key=dist)
-
-    def is_price_in_ob_zone(
-        self, price: float, ob: Dict[str, Any], tolerance: float = 0.002
-    ) -> bool:
-        """Check if price lies within the Order Block body ± tolerance.
-
-        Parameters
-        ----------
-        price : float
-            Price to test.
-        ob : dict
-            Order block dict.
-        tolerance : float
-            Fractional tolerance (default 0.2 % of price).
-
-        Returns
-        -------
-        bool
-        """
-        ob_top = max(ob["open"], ob["close"])
-        ob_bottom = min(ob["open"], ob["close"])
-        tol = price * tolerance
-        return (ob_bottom - tol) <= price <= (ob_top + tol)
+    def _create_block(self, candles: pd.DataFrame, idx: int, ob_type: str) -> Dict[str, Any]:
+        """Create an order block dictionary with scoring."""
+        candle = candles.iloc[idx]
+        high = candle['high']
+        low = candle['low']
+        
+        # Calculate strength based on the subsequent move
+        next_candles = candles.iloc[idx + 1:idx + 4]
+        if ob_type == 'bullish':
+            move = (next_candles['high'].max() - candle['close']) / candle['close']
+        else:
+            move = (candle['close'] - next_candles['low'].min()) / candle['close']
+        
+        # Score: strength (0-50) + freshness (0-30) + volume (0-20)
+        strength_score = min(move * 100 * 5, 50)  # 1% move = 5 points, cap at 50
+        
+        # Freshness: how recent (0-30)
+        freshness = max(0, 30 - (len(candles) - idx) * 2)
+        
+        # Volume: relative to average (0-20)
+        avg_volume = candles['volume'].mean() if 'volume' in candles.columns else 1
+        volume_ratio = candle.get('volume', avg_volume) / avg_volume if avg_volume > 0 else 1
+        volume_score = min(volume_ratio * 10, 20)
+        
+        total_score = strength_score + freshness + volume_score
+        
+        return {
+            'type': ob_type,
+            'high': float(high),
+            'low': float(low),
+            'score': round(total_score, 2),
+            'index': idx,
+            'strength': round(move * 100, 2),  # % move
+            'freshness': round(freshness, 2),
+            'volume_score': round(volume_score, 2),
+            'open': float(candle['open']),
+            'close': float(candle['close']),
+        }
